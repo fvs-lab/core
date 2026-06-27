@@ -1,7 +1,9 @@
 package core
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -38,5 +40,26 @@ func TestDiskBlockStore_DedupAndGet(t *testing.T) {
 	}
 	if string(b) != "hello" {
 		t.Fatalf("unexpected data: %q", string(b))
+	}
+}
+
+func TestDiskBlockStore_DetectsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDiskBlockStore(dir)
+	if err != nil {
+		t.Fatalf("NewDiskBlockStore: %v", err)
+	}
+	id, err := s.Put([]byte("important data"))
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Tamper with the stored block so its content no longer matches its id.
+	if err := os.WriteFile(filepath.Join(dir, string(id)), []byte("CORRUPTED"), 0o644); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+
+	if _, err := s.Get(id); !errors.Is(err, ErrBlockCorrupt) {
+		t.Fatalf("expected ErrBlockCorrupt, got %v", err)
 	}
 }

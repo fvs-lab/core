@@ -88,5 +88,11 @@ func (s *DiskBlockStore) Get(id BlockID) ([]byte, error) {
 		}
 		return nil, err
 	}
+	// Content-addressed integrity check: the file name is the BLAKE3 of its
+	// content, so re-hashing on read detects tampering and bit-rot instead of
+	// silently returning corrupt data.
+	if got := contentHashID(b); got != id {
+		return nil, fmt.Errorf("%w: %s", ErrBlockCorrupt, id)
+	}
 	return b, nil
 }
