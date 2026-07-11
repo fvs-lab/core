@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func readAll(t *testing.T, r interface{
+func readAll(t *testing.T, r interface {
 	ReadAt(p []byte, off int64) (int, error)
 	Size() int64
 }) string {

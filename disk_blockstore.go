@@ -1,10 +1,13 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // DiskBlockStore stores blocks as files named by BlockID inside a directory.
@@ -17,6 +20,17 @@ import (
 //
 // The directory should be private to the process/user.
 // This is intended as a small building block for the v2 daemon.
+
+// zstdMagic is the zstd frame header; block files starting with it hold
+// compressed content, anything else is a legacy raw block. The BlockID is
+// always the BLAKE3 of the uncompressed content, so compression stays a
+// storage detail: ids, dedup and the wire protocol never see it.
+var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+
+var (
+	zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	zstdDecoder, _ = zstd.NewReader(nil)
+)
 
 type DiskBlockStore struct {
 	dir string
@@ -60,7 +74,14 @@ func (s *DiskBlockStore) Put(data []byte) (BlockID, error) {
 		}
 	}()
 
-	if _, err := tmp.Write(data); err != nil {
+	stored := zstdEncoder.EncodeAll(data, nil)
+	// Incompressible content stays raw, except when the plain bytes start
+	// with the zstd magic themselves: storing those compressed keeps the
+	// reader's sniffing unambiguous.
+	if len(stored) >= len(data) && !bytes.HasPrefix(data, zstdMagic) {
+		stored = data
+	}
+	if _, err := tmp.Write(stored); err != nil {
 		return "", err
 	}
 	// Sync before rename so a crash cannot leave a torn block visible under
@@ -93,9 +114,16 @@ func (s *DiskBlockStore) Get(id BlockID) ([]byte, error) {
 		}
 		return nil, err
 	}
-	// Content-addressed integrity check: the file name is the BLAKE3 of its
-	// content, so re-hashing on read detects tampering and bit-rot instead of
-	// silently returning corrupt data.
+	if bytes.HasPrefix(b, zstdMagic) {
+		if plain, err := zstdDecoder.DecodeAll(b, nil); err == nil {
+			b = plain
+		}
+		// A failed decode falls through: a legacy raw block may begin with
+		// the magic by coincidence, and the hash check below decides.
+	}
+	// Content-addressed integrity check: the id is the BLAKE3 of the
+	// uncompressed content, so re-hashing on read detects tampering and
+	// bit-rot instead of silently returning corrupt data.
 	if got := contentHashID(b); got != id {
 		return nil, fmt.Errorf("%w: %s", ErrBlockCorrupt, id)
 	}
