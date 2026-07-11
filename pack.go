@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // Packs store chunks in immutable files of independent zstd frames. A frame
@@ -222,11 +224,53 @@ func (s *DiskBlockStore) readPacked(loc packLoc) ([]byte, error) {
 	return out, nil
 }
 
+// PackOptions tune the frame geometry and compression effort. Hot packs use
+// small frames for cheap random access; cold history uses large frames and
+// maximum effort, so whole file lineages share one compression window.
+type PackOptions struct {
+	// FrameTarget is the uncompressed frame size to cut at (default 256 KiB).
+	FrameTarget int
+	// BestCompression trades pack-time CPU for size.
+	BestCompression bool
+	// LongWindow enables long-distance matching inside frames.
+	LongWindow bool
+}
+
+// ColdPackOptions is the cold-tier preset: 4 MiB frames, maximum effort. The
+// first read of an old state costs one bigger decompression, still bounded.
+func ColdPackOptions() PackOptions {
+	return PackOptions{FrameTarget: 4 << 20, BestCompression: true, LongWindow: true}
+}
+
+func (o PackOptions) frameTarget() int {
+	if o.FrameTarget <= 0 {
+		return packFrameTarget
+	}
+	return o.FrameTarget
+}
+
+func (o PackOptions) encoder() (*zstd.Encoder, error) {
+	level := zstd.SpeedDefault
+	if o.BestCompression {
+		level = zstd.SpeedBestCompression
+	}
+	opts := []zstd.EOption{zstd.WithEncoderLevel(level)}
+	if o.LongWindow {
+		opts = append(opts, zstd.WithWindowSize(8<<20))
+	}
+	return zstd.NewWriter(nil, opts...)
+}
+
 // WritePack stores the given chunks, in the given order, into a new
 // immutable pack file, then removes their loose copies. Order matters: the
 // caller groups related chunks (versions of the same file) so the frame
 // compression window can capture their redundancy.
 func (s *DiskBlockStore) WritePack(ordered []BlockID) error {
+	return s.WritePackOptions(ordered, PackOptions{})
+}
+
+// WritePackOptions is WritePack with explicit frame geometry.
+func (s *DiskBlockStore) WritePackOptions(ordered []BlockID, opts PackOptions) error {
 	if len(ordered) == 0 {
 		return nil
 	}
@@ -251,13 +295,19 @@ func (s *DiskBlockStore) WritePack(ordered []BlockID) error {
 		return err
 	}
 
+	encoder, err := opts.encoder()
+	if err != nil {
+		return err
+	}
+	defer encoder.Close()
+
 	var buf bytes.Buffer
 	var entries []packEntry
 	flush := func() error {
 		if buf.Len() == 0 {
 			return nil
 		}
-		comp := zstdEncoder.EncodeAll(buf.Bytes(), nil)
+		comp := encoder.EncodeAll(buf.Bytes(), nil)
 		hdr := make([]byte, 4+4+8+4)
 		copy(hdr, frameMagic)
 		binary.BigEndian.PutUint32(hdr[4:8], uint32(len(comp)))
@@ -300,7 +350,7 @@ func (s *DiskBlockStore) WritePack(ordered []BlockID) error {
 		entries = append(entries, packEntry{id: id, offset: uint32(buf.Len()), length: uint32(len(data))})
 		buf.Write(data)
 		packed = append(packed, id)
-		if buf.Len() >= packFrameTarget {
+		if buf.Len() >= opts.frameTarget() {
 			if err := flush(); err != nil {
 				return err
 			}
@@ -337,6 +387,11 @@ func (s *DiskBlockStore) WritePack(ordered []BlockID) error {
 // old packs are deleted after the new one is durable; loose garbage is swept
 // in the same pass.
 func (s *DiskBlockStore) Compact(orderedLive []BlockID) error {
+	return s.CompactOptions(orderedLive, PackOptions{})
+}
+
+// CompactOptions is Compact with explicit frame geometry.
+func (s *DiskBlockStore) CompactOptions(orderedLive []BlockID, opts PackOptions) error {
 	if err := s.ensurePacks(); err != nil {
 		return err
 	}
@@ -347,7 +402,7 @@ func (s *DiskBlockStore) Compact(orderedLive []BlockID) error {
 	}
 	s.packMu.Unlock()
 
-	if err := s.WritePack(orderedLive); err != nil {
+	if err := s.WritePackOptions(orderedLive, opts); err != nil {
 		return err
 	}
 
