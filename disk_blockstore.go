@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -34,6 +36,11 @@ var (
 
 type DiskBlockStore struct {
 	dir string
+
+	packMu     sync.RWMutex
+	packLoaded bool
+	packIdx    map[BlockID]packLoc
+	frameCache *framePayloadCache
 }
 
 func NewDiskBlockStore(dir string) (*DiskBlockStore, error) {
@@ -43,7 +50,11 @@ func NewDiskBlockStore(dir string) (*DiskBlockStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &DiskBlockStore{dir: dir}, nil
+	return &DiskBlockStore{
+		dir:        dir,
+		packIdx:    map[BlockID]packLoc{},
+		frameCache: newFrameCache(32),
+	}, nil
 }
 
 func (s *DiskBlockStore) blockPath(id BlockID) string {
@@ -109,10 +120,19 @@ func (s *DiskBlockStore) Put(data []byte) (BlockID, error) {
 func (s *DiskBlockStore) Get(id BlockID) ([]byte, error) {
 	b, err := os.ReadFile(s.blockPath(id))
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if perr := s.ensurePacks(); perr != nil {
+			return nil, perr
+		}
+		s.packMu.RLock()
+		loc, ok := s.packIdx[id]
+		s.packMu.RUnlock()
+		if !ok {
 			return nil, ErrBlockNotFound
 		}
-		return nil, err
+		return s.readPacked(loc)
 	}
 	if bytes.HasPrefix(b, zstdMagic) {
 		if plain, err := zstdDecoder.DecodeAll(b, nil); err == nil {
@@ -136,10 +156,16 @@ func (s *DiskBlockStore) Has(id BlockID) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, err
 	}
-	return false, err
+	if err := s.ensurePacks(); err != nil {
+		return false, err
+	}
+	s.packMu.RLock()
+	_, ok := s.packIdx[id]
+	s.packMu.RUnlock()
+	return ok, nil
 }
 
 // ForEach calls fn for every block currently in the store. Temp files from
@@ -150,10 +176,19 @@ func (s *DiskBlockStore) ForEach(fn func(BlockID) error) error {
 		return err
 	}
 	for _, e := range ents {
-		if e.IsDir() || len(e.Name()) == 0 || e.Name()[0] == '.' {
+		name := e.Name()
+		if e.IsDir() || len(name) == 0 || name[0] == '.' || strings.HasPrefix(name, "pack-") {
 			continue
 		}
-		if err := fn(BlockID(e.Name())); err != nil {
+		if err := fn(BlockID(name)); err != nil {
+			return err
+		}
+	}
+	if err := s.ensurePacks(); err != nil {
+		return err
+	}
+	for _, id := range s.packedIDs() {
+		if err := fn(id); err != nil {
 			return err
 		}
 	}
@@ -163,16 +198,27 @@ func (s *DiskBlockStore) ForEach(fn func(BlockID) error) error {
 // Size returns the stored size of a block in bytes.
 func (s *DiskBlockStore) Size(id BlockID) (int64, error) {
 	info, err := os.Stat(s.blockPath(id))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, ErrBlockNotFound
-		}
+	if err == nil {
+		return info.Size(), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
 		return 0, err
 	}
-	return info.Size(), nil
+	if perr := s.ensurePacks(); perr != nil {
+		return 0, perr
+	}
+	s.packMu.RLock()
+	loc, ok := s.packIdx[id]
+	s.packMu.RUnlock()
+	if !ok {
+		return 0, ErrBlockNotFound
+	}
+	return int64(loc.frame.entries[loc.entry].length), nil
 }
 
-// Delete removes a block. Deleting a missing block is not an error.
+// Delete removes a loose block. Deleting a missing block is not an error;
+// chunks living inside packs are reclaimed by Compact (frame amnesty), so
+// deleting them individually is a no-op by design.
 func (s *DiskBlockStore) Delete(id BlockID) error {
 	err := os.Remove(s.blockPath(id))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
