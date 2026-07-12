@@ -48,6 +48,7 @@ type packFrame struct {
 	pack       string // pack file path
 	payloadOff int64  // offset of the compressed payload
 	compLen    uint32
+	checksum   uint64 // frame checksum from the header (BLAKE3 of the compressed payload, first 8 bytes)
 	entries    []packEntry
 }
 
@@ -170,8 +171,8 @@ func (s *DiskBlockStore) scanPack(path string) error {
 			pack:       path,
 			payloadOff: off + int64(len(hdr)) + int64(len(entryBytes)),
 			compLen:    compLen,
+			checksum:   sum,
 		}
-		_ = sum
 		for i := 0; i < int(count); i++ {
 			b := entryBytes[i*(32+4+4):]
 			frame.entries = append(frame.entries, packEntry{
@@ -204,6 +205,11 @@ func (s *DiskBlockStore) readPacked(loc packLoc) ([]byte, error) {
 		comp := make([]byte, frame.compLen)
 		if _, err := f.ReadAt(comp, frame.payloadOff); err != nil {
 			return nil, err
+		}
+		// Verify the frame checksum before handing the bytes to zstd: corrupt
+		// compressed data fails loudly here instead of relying on the decoder.
+		if frameChecksum(comp) != frame.checksum {
+			return nil, fmt.Errorf("%w: frame checksum mismatch in %s", ErrBlockCorrupt, filepath.Base(frame.pack))
 		}
 		payload, err = zstdDecoder.DecodeAll(comp, nil)
 		if err != nil {
@@ -470,6 +476,56 @@ func idBytes(id BlockID) ([]byte, error) {
 		out[i] = b
 	}
 	return out, nil
+}
+
+// VerifyPacks re-reads every pack frame, checking the stored frame checksum
+// against the compressed payload and every chunk's content address against
+// its extracted bytes. It returns how many frames and chunks were verified.
+func (s *DiskBlockStore) VerifyPacks() (frames, chunks int, err error) {
+	if err := s.ensurePacks(); err != nil {
+		return 0, 0, err
+	}
+	s.packMu.RLock()
+	seen := map[*packFrame]bool{}
+	var all []*packFrame
+	for _, loc := range s.packIdx {
+		if !seen[loc.frame] {
+			seen[loc.frame] = true
+			all = append(all, loc.frame)
+		}
+	}
+	s.packMu.RUnlock()
+
+	for _, frame := range all {
+		f, err := os.Open(frame.pack)
+		if err != nil {
+			return frames, chunks, err
+		}
+		comp := make([]byte, frame.compLen)
+		_, err = f.ReadAt(comp, frame.payloadOff)
+		_ = f.Close()
+		if err != nil {
+			return frames, chunks, fmt.Errorf("frame in %s: %w", filepath.Base(frame.pack), err)
+		}
+		if frameChecksum(comp) != frame.checksum {
+			return frames, chunks, fmt.Errorf("%w: frame checksum mismatch in %s", ErrBlockCorrupt, filepath.Base(frame.pack))
+		}
+		payload, err := zstdDecoder.DecodeAll(comp, nil)
+		if err != nil {
+			return frames, chunks, fmt.Errorf("%w: frame in %s: %v", ErrBlockCorrupt, filepath.Base(frame.pack), err)
+		}
+		for _, e := range frame.entries {
+			if int(e.offset)+int(e.length) > len(payload) {
+				return frames, chunks, fmt.Errorf("%w: %s: frame entry out of range", ErrBlockCorrupt, e.id)
+			}
+			if got := contentHashID(payload[e.offset : e.offset+e.length]); got != e.id {
+				return frames, chunks, fmt.Errorf("%w: %s", ErrBlockCorrupt, e.id)
+			}
+			chunks++
+		}
+		frames++
+	}
+	return frames, chunks, nil
 }
 
 // packedIDs lists every chunk currently reachable through packs, sorted for

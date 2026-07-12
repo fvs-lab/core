@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -190,5 +191,90 @@ func TestTextSniffDeterminism(t *testing.T) {
 	utf8 := []byte("verifica con testo accentato: perch\xc3\xa9 s\xc3\xac, \xc3\xa8 testo\n")
 	if !IsTextHead(bytes.Repeat(utf8, 50)) {
 		t.Fatal("utf-8 must sniff as text")
+	}
+}
+
+// TestFrameChecksumDetectsFlippedCompressedBytes flips one byte inside a
+// frame's compressed payload, leaving the header intact: the stored frame
+// checksum must catch it before zstd ever sees the bytes.
+func TestFrameChecksumDetectsFlippedCompressedBytes(t *testing.T) {
+	s, dir := packTestStore(t)
+	data := bytes.Repeat([]byte("checksummed"), 3000)
+	id, _ := s.Put(data)
+	if err := s.WritePack([]BlockID{id}); err != nil {
+		t.Fatal(err)
+	}
+	var packPath string
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "pack-") {
+			packPath = filepath.Join(dir, e.Name())
+		}
+	}
+	raw, _ := os.ReadFile(packPath)
+	// Layout: 5-byte pack header, 20-byte frame header, one 40-byte entry,
+	// then the compressed payload. Flip the payload's first byte.
+	payloadOff := 5 + 20 + 40
+	raw[payloadOff] ^= 0x01
+	if err := os.WriteFile(packPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := NewDiskBlockStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fresh.Get(id)
+	if !errors.Is(err, ErrBlockCorrupt) {
+		t.Fatalf("flipped compressed byte not detected as corruption: %v", err)
+	}
+	if !strings.Contains(err.Error(), "checksum") {
+		t.Fatalf("corruption must be caught by the frame checksum, got: %v", err)
+	}
+}
+
+// TestVerifyPacks checks the whole-store verification primitive: clean packs
+// pass with the right counts, a corrupted one fails.
+func TestVerifyPacks(t *testing.T) {
+	s, dir := packTestStore(t)
+	rng := rand.New(rand.NewSource(17))
+	var ids []BlockID
+	for i := 0; i < 10; i++ {
+		data := make([]byte, 2000+rng.Intn(4000))
+		rng.Read(data)
+		id, err := s.Put(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := s.WritePack(ids); err != nil {
+		t.Fatal(err)
+	}
+	frames, chunks, err := s.VerifyPacks()
+	if err != nil {
+		t.Fatalf("verify clean pack: %v", err)
+	}
+	if frames == 0 || chunks != len(ids) {
+		t.Fatalf("verified %d frames, %d chunks; want %d chunks", frames, chunks, len(ids))
+	}
+
+	var packPath string
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "pack-") {
+			packPath = filepath.Join(dir, e.Name())
+		}
+	}
+	raw, _ := os.ReadFile(packPath)
+	raw[len(raw)-1] ^= 0xff
+	if err := os.WriteFile(packPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := NewDiskBlockStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fresh.VerifyPacks(); !errors.Is(err, ErrBlockCorrupt) {
+		t.Fatalf("verify must fail on a corrupt pack, got: %v", err)
 	}
 }
