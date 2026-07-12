@@ -53,7 +53,7 @@ func NewDiskBlockStore(dir string) (*DiskBlockStore, error) {
 	return &DiskBlockStore{
 		dir:        dir,
 		packIdx:    map[BlockID]packLoc{},
-		frameCache: newFrameCache(32),
+		frameCache: newFrameCache(DefaultFrameCacheBytes),
 	}, nil
 }
 

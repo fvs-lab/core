@@ -58,24 +58,48 @@ type packLoc struct {
 	entry int
 }
 
-// framePayloadCache is a small LRU of decompressed frames: sequential reads
-// through a mount hit the same frame for neighboring chunks.
+// DefaultFrameCacheBytes bounds the decompressed frame cache: enough for
+// sequential reads through a mount to hit warm frames, small enough not to
+// compete with the page cache.
+const DefaultFrameCacheBytes = 64 << 20
+
+// framePayloadCache is an LRU of decompressed frames, bounded by total
+// payload bytes: sequential reads through a mount hit the same frame for
+// neighboring chunks. A hit promotes the frame, so eviction is
+// least-recently-used, not first-in.
 type framePayloadCache struct {
-	mu    sync.Mutex
-	max   int
-	order []*packFrame
-	data  map[*packFrame][]byte
+	mu       sync.Mutex
+	maxBytes int64
+	bytes    int64
+	order    []*packFrame // least recently used first
+	data     map[*packFrame][]byte
+	hits     int64
+	misses   int64
 }
 
-func newFrameCache(max int) *framePayloadCache {
-	return &framePayloadCache{max: max, data: map[*packFrame][]byte{}}
+func newFrameCache(maxBytes int64) *framePayloadCache {
+	if maxBytes <= 0 {
+		maxBytes = DefaultFrameCacheBytes
+	}
+	return &framePayloadCache{maxBytes: maxBytes, data: map[*packFrame][]byte{}}
 }
 
 func (c *framePayloadCache) get(f *packFrame) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b, ok := c.data[f]
-	return b, ok
+	if !ok {
+		c.misses++
+		return nil, false
+	}
+	c.hits++
+	for i, cur := range c.order {
+		if cur == f {
+			c.order = append(append(c.order[:i:i], c.order[i+1:]...), f)
+			break
+		}
+	}
+	return b, true
 }
 
 func (c *framePayloadCache) put(f *packFrame, b []byte) {
@@ -84,20 +108,62 @@ func (c *framePayloadCache) put(f *packFrame, b []byte) {
 	if _, ok := c.data[f]; ok {
 		return
 	}
-	if len(c.order) >= c.max {
-		oldest := c.order[0]
-		c.order = c.order[1:]
-		delete(c.data, oldest)
-	}
 	c.order = append(c.order, f)
 	c.data[f] = b
+	c.bytes += int64(len(b))
+	c.evictLocked()
+}
+
+// evictLocked drops least-recently-used frames until the cache fits its cap,
+// always keeping the most recent frame so one oversized payload still caches.
+func (c *framePayloadCache) evictLocked() {
+	for c.bytes > c.maxBytes && len(c.order) > 1 {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		c.bytes -= int64(len(c.data[oldest]))
+		delete(c.data, oldest)
+	}
+}
+
+func (c *framePayloadCache) setMaxBytes(n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n <= 0 {
+		n = DefaultFrameCacheBytes
+	}
+	c.maxBytes = n
+	c.evictLocked()
 }
 
 func (c *framePayloadCache) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.order = nil
+	c.bytes = 0
 	c.data = map[*packFrame][]byte{}
+}
+
+// FrameCacheStats reports the frame cache counters: hits, misses and the
+// decompressed bytes currently held.
+type FrameCacheStats struct {
+	Hits   int64
+	Misses int64
+	Bytes  int64
+}
+
+// FrameCacheStats returns the current frame cache counters.
+func (s *DiskBlockStore) FrameCacheStats() FrameCacheStats {
+	c := s.frameCache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return FrameCacheStats{Hits: c.hits, Misses: c.misses, Bytes: c.bytes}
+}
+
+// SetFrameCacheBytes caps the decompressed frame cache at n bytes (<= 0
+// restores the default), evicting immediately if the cache is over the new
+// cap.
+func (s *DiskBlockStore) SetFrameCacheBytes(n int64) {
+	s.frameCache.setMaxBytes(n)
 }
 
 // ensurePacks scans the pack files once and builds the chunk index.

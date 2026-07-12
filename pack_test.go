@@ -278,3 +278,58 @@ func TestVerifyPacks(t *testing.T) {
 		t.Fatalf("verify must fail on a corrupt pack, got: %v", err)
 	}
 }
+
+// TestFrameCacheLRUPromotion checks that a hit protects a frame from
+// eviction: the least recently used frame goes, not the oldest inserted.
+func TestFrameCacheLRUPromotion(t *testing.T) {
+	a, b, c := &packFrame{}, &packFrame{}, &packFrame{}
+	cache := newFrameCache(30)
+	cache.put(a, make([]byte, 10))
+	cache.put(b, make([]byte, 10))
+	cache.put(c, make([]byte, 10))
+	if _, ok := cache.get(a); !ok { // promote a: b is now the LRU
+		t.Fatal("a should be cached")
+	}
+	d := &packFrame{}
+	cache.put(d, make([]byte, 10)) // over the 30-byte cap: evicts b
+	if _, ok := cache.get(b); ok {
+		t.Fatal("b should have been evicted as least recently used")
+	}
+	if _, ok := cache.get(a); !ok {
+		t.Fatal("promoted a must survive the eviction")
+	}
+	if cache.bytes != 30 {
+		t.Fatalf("cache holds %d bytes, want 30", cache.bytes)
+	}
+}
+
+// TestFrameCacheStats counts one miss for the cold read and one hit for the
+// warm one.
+func TestFrameCacheStats(t *testing.T) {
+	s, _ := packTestStore(t)
+	data := bytes.Repeat([]byte("stats"), 4000)
+	id, _ := s.Put(data)
+	if err := s.WritePack([]BlockID{id}); err != nil {
+		t.Fatal(err)
+	}
+	base := s.FrameCacheStats()
+	if _, err := s.Get(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(id); err != nil {
+		t.Fatal(err)
+	}
+	st := s.FrameCacheStats()
+	if st.Misses-base.Misses != 1 || st.Hits-base.Hits != 1 {
+		t.Fatalf("stats after cold+warm read: %+v (base %+v)", st, base)
+	}
+	if st.Bytes == 0 {
+		t.Fatal("cached bytes not accounted")
+	}
+
+	// Shrinking the cap below the held payload evicts down to one frame.
+	s.SetFrameCacheBytes(1)
+	if got := s.FrameCacheStats().Bytes; got > int64(len(data)) {
+		t.Fatalf("cache did not shrink: %d bytes", got)
+	}
+}
