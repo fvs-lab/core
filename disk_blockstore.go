@@ -57,6 +57,16 @@ func NewDiskBlockStore(dir string) (*DiskBlockStore, error) {
 	}, nil
 }
 
+// syncDir fsyncs a directory so a rename inside it is durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 func (s *DiskBlockStore) blockPath(id BlockID) string {
 	return filepath.Join(s.dir, string(id))
 }
@@ -114,6 +124,10 @@ func (s *DiskBlockStore) Put(data []byte) (BlockID, error) {
 	}
 
 	ok = true
+	// fsync the directory so the rename itself is durable.
+	if err := syncDir(s.dir); err != nil {
+		return "", err
+	}
 	return id, nil
 }
 

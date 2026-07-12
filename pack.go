@@ -442,6 +442,11 @@ func (s *DiskBlockStore) WritePackOptions(ordered []BlockID, opts PackOptions) e
 		return err
 	}
 	ok = true
+	// fsync the directory so the rename itself is durable before the loose
+	// copies disappear.
+	if err := syncDir(s.dir); err != nil {
+		return err
+	}
 
 	// The pack is durable: loose copies of its chunks are now redundant.
 	for _, id := range packed {
