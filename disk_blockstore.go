@@ -30,7 +30,7 @@ import (
 var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
 
 var (
-	zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
 	zstdDecoder, _ = zstd.NewReader(nil)
 )
 
