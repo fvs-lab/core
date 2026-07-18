@@ -63,3 +63,21 @@ func TestDiskBlockStore_DetectsCorruption(t *testing.T) {
 		t.Fatalf("expected ErrBlockCorrupt, got %v", err)
 	}
 }
+
+func TestDiskBlockStore_DeferredPut(t *testing.T) {
+	s, err := NewDiskBlockStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.PutDeferred([]byte("batched"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(id)
+	if err != nil || string(got) != "batched" {
+		t.Fatalf("Get() = %q, %v", got, err)
+	}
+}
