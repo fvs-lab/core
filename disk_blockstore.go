@@ -72,6 +72,20 @@ func (s *DiskBlockStore) blockPath(id BlockID) string {
 }
 
 func (s *DiskBlockStore) Put(data []byte) (BlockID, error) {
+	return s.put(data, true)
+}
+
+// PutDeferred writes a block but leaves directory durability to Sync.
+func (s *DiskBlockStore) PutDeferred(data []byte) (BlockID, error) {
+	return s.put(data, false)
+}
+
+// Sync makes prior deferred block renames durable.
+func (s *DiskBlockStore) Sync() error {
+	return syncDir(s.dir)
+}
+
+func (s *DiskBlockStore) put(data []byte, sync bool) (BlockID, error) {
 	id := contentHashID(data)
 	finalPath := s.blockPath(id)
 
@@ -124,9 +138,11 @@ func (s *DiskBlockStore) Put(data []byte) (BlockID, error) {
 	}
 
 	ok = true
-	// fsync the directory so the rename itself is durable.
-	if err := syncDir(s.dir); err != nil {
-		return "", err
+	// Standalone puts are durable immediately; transactions batch this sync.
+	if sync {
+		if err := syncDir(s.dir); err != nil {
+			return "", err
+		}
 	}
 	return id, nil
 }
