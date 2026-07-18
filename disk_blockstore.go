@@ -67,6 +67,15 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
+func syncStore(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return syncFilesystem(d)
+}
+
 func (s *DiskBlockStore) blockPath(id BlockID) string {
 	return filepath.Join(s.dir, string(id))
 }
@@ -82,7 +91,7 @@ func (s *DiskBlockStore) PutDeferred(data []byte) (BlockID, error) {
 
 // Sync makes prior deferred block renames durable.
 func (s *DiskBlockStore) Sync() error {
-	return syncDir(s.dir)
+	return syncStore(s.dir)
 }
 
 func (s *DiskBlockStore) put(data []byte, sync bool) (BlockID, error) {
@@ -121,8 +130,10 @@ func (s *DiskBlockStore) put(data []byte, sync bool) (BlockID, error) {
 	}
 	// Sync before rename so a crash cannot leave a torn block visible under
 	// its final name.
-	if err := tmp.Sync(); err != nil {
-		return "", err
+	if sync || !hasFilesystemSync {
+		if err := tmp.Sync(); err != nil {
+			return "", err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return "", err
