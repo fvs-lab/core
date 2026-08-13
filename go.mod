@@ -1,4 +1,4 @@
-module fvs-v2-core
+module github.com/fvs-lab/core
 
 go 1.24.0
 
