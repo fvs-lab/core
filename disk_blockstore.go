@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -41,6 +42,9 @@ type DiskBlockStore struct {
 	packLoaded bool
 	packIdx    map[BlockID]packLoc
 	frameCache *framePayloadCache
+
+	objectMu sync.Mutex
+	objects  *ObjectStore
 }
 
 func NewDiskBlockStore(dir string) (*DiskBlockStore, error) {
@@ -55,6 +59,20 @@ func NewDiskBlockStore(dir string) (*DiskBlockStore, error) {
 		packIdx:    map[BlockID]packLoc{},
 		frameCache: newFrameCache(DefaultFrameCacheBytes),
 	}, nil
+}
+
+// NewObjectBackedBlockStore opens one block store and its shared object index.
+func NewObjectBackedBlockStore(dir string) (*DiskBlockStore, *ObjectStore, error) {
+	blocks, err := NewDiskBlockStore(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	objects, err := OpenObjectStore(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	blocks.objects = objects
+	return blocks, objects, nil
 }
 
 // syncDir fsyncs a directory so a rename inside it is durable.
@@ -164,6 +182,11 @@ func (s *DiskBlockStore) Get(id BlockID) ([]byte, error) {
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
+		if b, found, objectErr := s.getObjectRange(id); objectErr != nil {
+			return nil, objectErr
+		} else if found {
+			return b, nil
+		}
 		if perr := s.ensurePacks(); perr != nil {
 			return nil, perr
 		}
@@ -199,6 +222,14 @@ func (s *DiskBlockStore) Has(id BlockID) (bool, error) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return false, err
+	}
+	if store, err := s.objectStore(); err != nil {
+		return false, err
+	} else if store != nil {
+		_, found, err := store.index.lookup(id, store.validRange)
+		if err != nil || found {
+			return found, err
+		}
 	}
 	if err := s.ensurePacks(); err != nil {
 		return false, err
@@ -245,6 +276,17 @@ func (s *DiskBlockStore) Size(id BlockID) (int64, error) {
 	if !errors.Is(err, os.ErrNotExist) {
 		return 0, err
 	}
+	if store, err := s.objectStore(); err != nil {
+		return 0, err
+	} else if store != nil {
+		record, found, err := store.index.lookup(id, store.validRange)
+		if err != nil {
+			return 0, err
+		}
+		if found {
+			return int64(record.length), nil
+		}
+	}
 	if perr := s.ensurePacks(); perr != nil {
 		return 0, perr
 	}
@@ -266,4 +308,57 @@ func (s *DiskBlockStore) Delete(id BlockID) error {
 		return err
 	}
 	return nil
+}
+
+// CollectObjectGarbage removes whole-file objects which contain no live block.
+func (s *DiskBlockStore) CollectObjectGarbage(ctx context.Context, live map[BlockID]struct{}, dryRun bool) (ObjectGCResult, error) {
+	store, err := s.objectStore()
+	if err != nil || store == nil {
+		return ObjectGCResult{}, err
+	}
+	return store.CollectGarbage(ctx, live, dryRun)
+}
+
+func (s *DiskBlockStore) getObjectRange(id BlockID) ([]byte, bool, error) {
+	store, err := s.objectStore()
+	if err != nil || store == nil {
+		return nil, false, err
+	}
+	record, found, err := store.index.lookup(id, store.validRange)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	file, err := os.Open(store.objectPath(blockID(record.object)))
+	if err != nil {
+		return nil, false, err
+	}
+	defer file.Close()
+	data := make([]byte, record.length)
+	if _, err := file.ReadAt(data, int64(record.offset)); err != nil {
+		return nil, false, err
+	}
+	if contentHashID(data) != id {
+		return nil, false, fmt.Errorf("%w: %s", ErrBlockCorrupt, id)
+	}
+	return data, true, nil
+}
+
+func (s *DiskBlockStore) objectStore() (*ObjectStore, error) {
+	s.objectMu.Lock()
+	defer s.objectMu.Unlock()
+	if s.objects != nil {
+		return s.objects, nil
+	}
+	if info, err := os.Stat(filepath.Join(s.dir, ".objects")); err != nil || !info.IsDir() {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	store, err := OpenObjectStore(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	s.objects = store
+	return store, nil
 }
