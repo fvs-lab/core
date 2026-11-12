@@ -27,6 +27,15 @@ data, _ := store.Get(id)              // re-hashed on read; ErrBlockCorrupt on t
 `CoWFile` builds on a `BlockStore` plus a `CoWMap` to give a block-addressed,
 copy-on-write file with `ReadAt` / `WriteAt` and immutable `Snapshot()` views.
 
+## Platforms
+
+The storage engine builds on Linux and macOS without FUSE, Swift or an Apple
+SDK. Linux-only reflink and `syncfs` calls have separate build tags. macOS uses
+the existing copy and per-file synchronization paths, POSIX advisory locks
+and atomic renames. File synchronization errors are propagated; the port adds
+no new power-loss guarantee or repository format. Native mounts are provided
+by [fvs2d](https://github.com/fvs-lab/fvs2d), outside this storage module.
+
 ## Test
 
 ```bash
